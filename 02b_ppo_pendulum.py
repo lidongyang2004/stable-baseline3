@@ -55,7 +55,7 @@ from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="SB3 PPO 求解 Pendulum-v1 连续动作控制示例")
     parser.add_argument(
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def format_policy_std(model: PPO) -> str:
+def format_policy_std(model):
     """提取并格式化当前策略网络的高斯动作标准差 σ = exp(log_std)，方便观察探索幅度变化。"""
     with torch.no_grad():
         if model.use_sde:
@@ -91,7 +91,7 @@ def format_policy_std(model: PPO) -> str:
             return f"σ = {std} (对应可学习参数 log_std = {log_std})"
 
 
-def main() -> None:
+def main():
     args = parse_args()
     env_id = "Pendulum-v1"
 

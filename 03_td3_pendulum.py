@@ -54,7 +54,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.noise import NormalActionNoise
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="SB3 TD3 求解 Pendulum-v1 连续控制示例")
     parser.add_argument(
@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
     env_id = "Pendulum-v1"
 

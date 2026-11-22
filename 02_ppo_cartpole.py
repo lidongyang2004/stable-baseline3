@@ -42,7 +42,7 @@ from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="SB3 PPO 并行环境训练 CartPole-v1 示例")
     parser.add_argument(
@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
     env_id = "CartPole-v1"
 
