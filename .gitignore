@@ -1,6 +1,7 @@
 .venv/
 logs/
 models/
+wandb/
 __pycache__/
 *.pyc
 *.zip

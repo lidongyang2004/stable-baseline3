@@ -37,12 +37,15 @@ TD3 提出了三项极具工程威力的改进（也是名字 Twin Delayed 的�
   随机策略总分通常在 -1200 ~ -1600 左右。
 
 运行方式：
-    python 03_td3_pendulum.py                  # 使用默认步数 (20000 步) 完整训练
-    python 03_td3_pendulum.py --timesteps 5000 # 快速测试全流程
+    python 03_td3_pendulum.py                                  # 使用默认步数 (20000 步) 完整训练
+    python 03_td3_pendulum.py --timesteps 5000                 # 快速测试全流程
+    python 03_td3_pendulum.py --wandb                          # 开启 W&B 在线实验追踪
+    python 03_td3_pendulum.py --wandb --wandb-mode offline     # 开启 W&B 离线本地记录
 ================================================================================
 """
 
 import argparse
+import time
 from pathlib import Path
 
 import gymnasium as gym
@@ -52,6 +55,18 @@ from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.noise import NormalActionNoise
+
+from wandb_utils import (
+    add_wandb_args,
+    build_callbacks,
+    finish_wandb,
+    get_tb_log_name,
+    has_updated_best_model,
+    init_wandb,
+    log_eval_summary,
+    log_model_artifact,
+    prepare_run_dirs,
+)
 
 
 def parse_args():
@@ -64,6 +79,12 @@ def parse_args():
         help="总训练步数（Pendulum-v1 在 20000 步左右即可取得优异表现）",
     )
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument(
+        "--keep-history",
+        action="store_true",
+        help="保留历史训练日志与旧模型（默认每次开训前清空当前算法目录，仅保留最新一次）",
+    )
+    add_wandb_args(parser)
     return parser.parse_args()
 
 
@@ -74,153 +95,218 @@ def main():
     base_dir = Path(__file__).resolve().parent
     model_dir = base_dir / "models" / "td3_pendulum"
     log_dir = base_dir / "logs" / "td3_pendulum"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
 
-    # ==========================================================================
-    # 第 1 步：环境初始化与连续动作空间剖析
-    # ==========================================================================
-    print("=" * 70)
-    print(f"[第 1 步] 创建 Gymnasium 连续控制环境: {env_id}")
-    train_env = Monitor(gym.make(env_id))
-    eval_env = Monitor(gym.make(env_id))
+    train_env = None
+    eval_env = None
+    demo_env = None
+    wandb_run = None
 
-    print(f"  观测空间 (Observation Space): {train_env.observation_space}")
-    print(f"  动作空间 (Action Space):      {train_env.action_space}")
-    print(f"  动作维度 (n_actions):         {train_env.action_space.shape[-1]}")
-    print(f"  动作下界 (Low):               {train_env.action_space.low}")
-    print(f"  动作上界 (High):              {train_env.action_space.high}")
+    try:
+        # ======================================================================
+        # 第 1 步：环境初始化与连续动作空间剖析
+        # ======================================================================
+        print("=" * 70)
+        print(f"[第 1 步] 创建 Gymnasium 连续控制环境: {env_id}")
+        train_env = Monitor(gym.make(env_id))
+        eval_env = Monitor(gym.make(env_id))
 
-    # ==========================================================================
-    # 第 2 步：配置探索噪声、网络结构与 TD3 模型
-    # ==========================================================================
-    print("\n[第 2 步] 配置动作探索噪声与 TD3 核心超参数...")
+        print(f"  观测空间 (Observation Space): {train_env.observation_space}")
+        print(f"  动作空间 (Action Space):      {train_env.action_space}")
+        print(f"  动作维度 (n_actions):         {train_env.action_space.shape[-1]}")
+        print(f"  动作下界 (Low):               {train_env.action_space.low}")
+        print(f"  动作上界 (High):              {train_env.action_space.high}")
 
-    # 获取连续动作的维度（Pendulum-v1 为 1 维）
-    n_actions = train_env.action_space.shape[-1]
-    # 构造独立同分布的高斯动作噪声：均值为 0，标准差为 0.1（相对于动作范围 [-2, 2] 来说探索幅度适中）
-    # SB3 在 model.learn() 期间会自动把该噪声加到 Actor 输出的动作上（并裁剪到合法动作范围）
-    action_noise = NormalActionNoise(
-        mean=np.zeros(n_actions),
-        sigma=0.1 * np.ones(n_actions),
-    )
+        # ======================================================================
+        # 第 2 步：配置探索噪声、网络结构与 TD3 模型（及可选 W&B 初始化）
+        # ======================================================================
+        print("\n[第 2 步] 配置动作探索噪声与 TD3 核心超参数...")
 
-    # 对 Off-Policy Actor-Critic 算法（TD3 / SAC），net_arch 字典中：
-    # - pi 代表 Actor（策略网络）的隐藏层结构
-    # - qf 代表 Critic（Q 价值网络）的隐藏层结构（注意不是 vf，因为 TD3 学的是 Q(s,a)）
-    policy_kwargs = dict(net_arch=dict(pi=[256, 256], qf=[256, 256]))
+        # 获取连续动作的维度（Pendulum-v1 为 1 维）
+        n_actions = train_env.action_space.shape[-1]
+        action_noise_sigma = 0.1
+        # 构造独立同分布的高斯动作噪声：均值为 0，标准差为 0.1（相对于动作范围 [-2, 2] 来说探索幅度适中）
+        # SB3 在 model.learn() 期间会自动把该噪声加到 Actor 输出的动作上（并裁剪到合法动作范围）
+        action_noise = NormalActionNoise(
+            mean=np.zeros(n_actions),
+            sigma=action_noise_sigma * np.ones(n_actions),
+        )
 
-    model = TD3(
-        policy="MlpPolicy",
-        env=train_env,
+        # 对 Off-Policy Actor-Critic 算法（TD3 / SAC），net_arch 字典中：
+        # - pi 代表 Actor（策略网络）的隐藏层结构
+        # - qf 代表 Critic（Q 价值网络）的隐藏层结构（注意不是 vf，因为 TD3 学的是 Q(s,a)）
+        policy_kwargs = dict(net_arch=dict(pi=[256, 256], qf=[256, 256]))
 
-        # --- 学习率、折扣与经验回放池 ---
-        learning_rate=1e-3,          # 学习率（Pendulum 常用 1e-3，复杂 MuJoCo 环境常用 3e-4）
-        gamma=0.99,                  # 折扣因子 γ
-        buffer_size=100_000,         # 经验回放池大小
-        learning_starts=1_000,       # 预热步数：前 1000 步纯粹随机采样填充经验池，之后开始梯度更新
-        batch_size=100,              # 每次更新采样的批大小（TD3 论文默认 100 或 256）
+        hyperparams = dict(
+            # --- 学习率、折扣与经验回放池 ---
+            learning_rate=1e-3,          # 学习率（Pendulum 常用 1e-3，复杂 MuJoCo 环境常用 3e-4）
+            gamma=0.99,                  # 折扣因子 γ
+            buffer_size=100_000,         # 经验回放池大小
+            learning_starts=1_000,       # 预热步数：前 1000 步纯粹随机采样填充经验池，之后开始梯度更新
+            batch_size=100,              # 每次更新采样的批大小（TD3 论文默认 100 或 256）
 
-        # --- 训练频率与软更新 ---
-        train_freq=(1, "episode"),   # 每结束 1 个完整回合（或设为 1 表示每 1 步）执行一次更新
-        gradient_steps=-1,           # -1 表示本次收集了多少步环境数据，就做多少次梯度更新（与 train_freq=(1,"episode") 配合极佳）
-        tau=0.005,                   # 目标网络软更新系数（Polyak Averaging）：θ_target = τ*θ + (1-τ)*θ_target
+            # --- 训练频率与软更新 ---
+            train_freq=(1, "episode"),   # 每结束 1 个完整回合（或设为 1 表示每 1 步）执行一次更新
+            gradient_steps=-1,           # -1 表示本次收集了多少步环境数据，就做多少次梯度更新（与 train_freq=(1,"episode") 配合极佳）
+            tau=0.005,                   # 目标网络软更新系数（Polyak Averaging）：θ_target = τ*θ + (1-τ)*θ_target
 
-        # --- TD3 专属核心超参数 ---
-        action_noise=action_noise,   # 探索噪声对象（极其重要！不传则确定性策略几乎不探索）
-        policy_delay=2,              # 延迟策略更新：Critic 更新 2 次，Actor 与目标网络才更新 1 次
-        target_policy_noise=0.2,     # 目标策略平滑噪声标准差：计算目标 Q 值时给目标动作加的高斯噪声
-        target_noise_clip=0.5,       # 目标策略平滑噪声裁剪边界 [-0.5, 0.5]
+            # --- TD3 专属核心超参数 ---
+            policy_delay=2,              # 延迟策略更新：Critic 更新 2 次，Actor 与目标网络才更新 1 次
+            target_policy_noise=0.2,     # 目标策略平滑噪声标准差：计算目标 Q 值时给目标动作加的高斯噪声
+            target_noise_clip=0.5,       # 目标策略平滑噪声裁剪边界 [-0.5, 0.5]
+        )
 
-        # --- 网络结构与日志 ---
-        policy_kwargs=policy_kwargs,
-        tensorboard_log=str(log_dir),
-        seed=args.seed,
-        verbose=1,
-    )
+        wandb_run = init_wandb(
+            args,
+            env_id=env_id,
+            algo_name="TD3",
+            default_run_name=f"TD3_Pendulum_seed{args.seed}",
+            default_tags=["Pendulum-v1", "TD3", "Continuous", "Off-Policy"],
+            config={
+                "policy": "MlpPolicy",
+                "total_timesteps": args.timesteps,
+                "seed": args.seed,
+                "net_arch": policy_kwargs["net_arch"],
+                "action_noise_type": "NormalActionNoise",
+                "action_noise_sigma": action_noise_sigma,
+                **hyperparams,
+            },
+            base_dir=base_dir,
+        )
+        prepare_run_dirs(model_dir, log_dir, base_dir=base_dir, keep_history=args.keep_history)
 
-    # ==========================================================================
-    # 第 3 步：训练前基线评估
-    # ==========================================================================
-    print("\n[第 3 步] 训练前基线评估...")
-    mean_reward_before, std_reward_before = evaluate_policy(
-        model, eval_env, n_eval_episodes=10, deterministic=True
-    )
-    print(f"  训练前平均奖励: {mean_reward_before:.2f} +/- {std_reward_before:.2f}")
+        model = TD3(
+            policy="MlpPolicy",
+            env=train_env,
+            action_noise=action_noise,   # 探索噪声对象（极其重要！不传则确定性策略几乎不探索）
+            **hyperparams,
+            # --- 网络结构与日志 ---
+            policy_kwargs=policy_kwargs,
+            tensorboard_log=str(log_dir),
+            seed=args.seed,
+            verbose=1,
+        )
 
-    # ==========================================================================
-    # 第 4 步：配置 EvalCallback 并启动训练
-    # ==========================================================================
-    print(f"\n[第 4 步] 开始训练 TD3（总步数 total_timesteps={args.timesteps}）...")
-    eval_freq = max(1_000, args.timesteps // 5)
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=str(model_dir),
-        log_path=str(log_dir),
-        eval_freq=eval_freq,
-        n_eval_episodes=5,
-        deterministic=True,
-        render=False,
-    )
+        # ======================================================================
+        # 第 3 步：训练前基线评估
+        # ======================================================================
+        print("\n[第 3 步] 训练前基线评估...")
+        mean_reward_before, std_reward_before = evaluate_policy(
+            model, eval_env, n_eval_episodes=10, deterministic=True
+        )
+        print(f"  训练前平均奖励: {mean_reward_before:.2f} +/- {std_reward_before:.2f}")
 
-    model.learn(
-        total_timesteps=args.timesteps,
-        callback=eval_callback,
-        tb_log_name="TD3_Pendulum",
-        progress_bar=False,
-    )
+        # ======================================================================
+        # 第 4 步：配置 EvalCallback 并启动训练
+        # ======================================================================
+        print(f"\n[第 4 步] 开始训练 TD3（总步数 total_timesteps={args.timesteps}）...")
+        eval_freq = max(1_000, args.timesteps // 5)
+        eval_callback = EvalCallback(
+            eval_env,
+            best_model_save_path=str(model_dir),
+            log_path=str(log_dir),
+            eval_freq=eval_freq,
+            n_eval_episodes=5,
+            deterministic=True,
+            render=False,
+        )
+        callbacks = build_callbacks(eval_callback, wandb_run)
+        tb_log_name = get_tb_log_name("TD3_Pendulum", wandb_run)
 
-    # ==========================================================================
-    # 第 5 步：训练后定量评估
-    # ==========================================================================
-    print("\n[第 5 步] 训练完成！正在评估最终模型表现...")
-    mean_reward_after, std_reward_after = evaluate_policy(
-        model, eval_env, n_eval_episodes=10, deterministic=True
-    )
-    print(f"  训练前平均奖励: {mean_reward_before:.2f} +/- {std_reward_before:.2f}")
-    print(f"  训练后平均奖励: {mean_reward_after:.2f} +/- {std_reward_after:.2f}")
+        run_start_time = time.time()
+        model.learn(
+            total_timesteps=args.timesteps,
+            callback=callbacks,
+            tb_log_name=tb_log_name,
+            progress_bar=False,
+        )
 
-    # ==========================================================================
-    # 第 6 步：模型保存与重新加载
-    # ==========================================================================
-    final_model_path = model_dir / "td3_pendulum_final.zip"
-    print(f"\n[第 6 步] 保存最终模型到: {final_model_path}")
-    model.save(final_model_path)
+        # ======================================================================
+        # 第 5 步：训练后定量评估
+        # ======================================================================
+        print("\n[第 5 步] 训练完成！正在评估最终模型表现...")
+        mean_reward_after, std_reward_after = evaluate_policy(
+            model, eval_env, n_eval_episodes=10, deterministic=True
+        )
+        print(f"  训练前平均奖励: {mean_reward_before:.2f} +/- {std_reward_before:.2f}")
+        print(f"  训练后平均奖励: {mean_reward_after:.2f} +/- {std_reward_after:.2f}")
 
-    del model
-    best_model_path = model_dir / "best_model.zip"
-    load_path = best_model_path if best_model_path.exists() else final_model_path
-    print(f"  从磁盘重新加载模型: {load_path}")
-    loaded_model = TD3.load(load_path, env=eval_env)
+        # ======================================================================
+        # 第 6 步：模型保存与重新加载
+        # ======================================================================
+        final_model_path = model_dir / "td3_pendulum_final.zip"
+        print(f"\n[第 6 步] 保存最终模型到: {final_model_path}")
+        model.save(final_model_path)
 
-    # ==========================================================================
-    # 第 7 步：Gymnasium 标准五元组推理闭环演示
-    # ==========================================================================
-    print("\n[第 7 步] 使用加载的模型运行 1 个完整推理回合...")
-    demo_env = gym.make(env_id)
-    obs, info = demo_env.reset(seed=args.seed)
+        del model
+        best_model_path = model_dir / "best_model.zip"
+        best_model_updated = has_updated_best_model(eval_callback, best_model_path, run_start_time)
+        load_path = best_model_path if best_model_updated else final_model_path
+        print(f"  从磁盘重新加载模型: {load_path}")
+        loaded_model = TD3.load(load_path, env=eval_env)
 
-    episode_reward = 0.0
-    step_count = 0
+        # ======================================================================
+        # 第 7 步：Gymnasium 标准五元组推理闭环演示
+        # ======================================================================
+        print("\n[第 7 步] 使用加载的模型运行 1 个完整推理回合...")
+        demo_env = gym.make(env_id)
+        obs, info = demo_env.reset(seed=args.seed)
 
-    while True:
-        # 推理时 deterministic=True，直接使用 Actor 输出的确定性连续动作（不加探索噪声）
-        action, _states = loaded_model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = demo_env.step(action)
+        episode_reward = 0.0
+        step_count = 0
 
-        episode_reward += float(reward)
-        step_count += 1
+        while True:
+            # 推理时 deterministic=True，直接使用 Actor 输出的确定性连续动作（不加探索噪声）
+            action, _states = loaded_model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = demo_env.step(action)
 
-        if terminated or truncated:
-            # Pendulum-v1 没有失败终止状态，总是在 200 步时由时间上限触发 truncated=True
-            reason = "达到 200 步最大步数截断 (truncated)" if truncated else "任务终止 (terminated)"
-            print(f"  推理回合结束 | 总步数: {step_count} | 累计奖励: {episode_reward:.2f} | 结束原因: {reason}")
-            break
+            episode_reward += float(reward)
+            step_count += 1
 
-    train_env.close()
-    eval_env.close()
-    demo_env.close()
-    print("=" * 70)
+            if terminated or truncated:
+                # Pendulum-v1 没有失败终止状态，总是在 200 步时由时间上限触发 truncated=True
+                reason = "达到 200 步最大步数截断 (truncated)" if truncated else "任务终止 (terminated)"
+                print(f"  推理回合结束 | 总步数: {step_count} | 累计奖励: {episode_reward:.2f} | 结束原因: {reason}")
+                break
+
+        log_eval_summary(
+            wandb_run,
+            {
+                "eval/before_mean_reward": float(mean_reward_before),
+                "eval/before_std_reward": float(std_reward_before),
+                "eval/after_mean_reward": float(mean_reward_after),
+                "eval/after_std_reward": float(std_reward_after),
+                "eval/reward_gain": float(mean_reward_after - mean_reward_before),
+                "eval/best_model_updated": best_model_updated,
+                "demo/episode_reward": float(episode_reward),
+                "demo/episode_steps": int(step_count),
+            },
+        )
+        log_model_artifact(
+            wandb_run,
+            artifact_name="td3-pendulum-model",
+            final_model_path=final_model_path,
+            best_model_path=best_model_path,
+            best_model_updated=best_model_updated,
+            metadata={
+                "algorithm": "TD3",
+                "env_id": env_id,
+                "seed": args.seed,
+                "total_timesteps": args.timesteps,
+                "eval_before_mean_reward": float(mean_reward_before),
+                "eval_after_mean_reward": float(mean_reward_after),
+                "demo_episode_reward": float(episode_reward),
+            },
+            aliases=["latest", f"seed-{args.seed}"],
+        )
+    finally:
+        if demo_env is not None:
+            demo_env.close()
+        if eval_env is not None:
+            eval_env.close()
+        if train_env is not None:
+            train_env.close()
+        finish_wandb(wandb_run)
+        print("=" * 70)
 
 
 if __name__ == "__main__":
